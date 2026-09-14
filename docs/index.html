@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>herald — cross-pane messaging between agent sessions (herdr, CLI)</title>
+<meta name="description" content="herald is a single bash script that lets two agent sessions in different herdr panes, tabs or workspaces message each other directly, with a per-channel delivery budget that pauses for human review. Free and open source.">
+<meta name="keywords" content="herdr, agent sessions, terminal multiplexer, cli messaging, ai coding agents, bash, tmux alternative">
+<link rel="canonical" href="https://budhash.com/herald/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://budhash.com/herald/">
+<meta property="og:title" content="herald — cross-pane messaging between agent sessions">
+<meta property="og:description" content="Two agent sessions in different herdr panes message each other directly — bounded by a delivery budget that pauses for human review.">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="herald — cross-pane messaging between agent sessions">
+<meta name="twitter:description" content="Two agent sessions in different herdr panes message each other directly — bounded by a delivery budget that pauses for human review.">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "herald",
+  "url": "https://budhash.com/herald/",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Linux",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "description": "A single bash script for bounded, human-gated messaging between two agent sessions running under herdr.",
+  "author": { "@type": "Person", "name": "budhash", "url": "https://github.com/budhash" }
+}
+</script>
+<link rel="stylesheet" href="theme.css">
+<style>
+  /* Page layout only — design tokens & primitives live in theme.css.
+     These are the reusable bits (container, header links, About dialog, footer)
+     shared across budhash.com tools; add your tool's own styles below. */
+  .app { max-width: min(1160px, 94vw); margin: 0 auto; padding: clamp(24px, 4vh, 52px) clamp(20px, 3vw, 48px) 40px; min-height: 100vh; display: flex; flex-direction: column; }
+  h1 .dev { color: var(--accent); }
+
+  /* page-specific: doc panels for a CLI tool (no interactive UI) */
+  .content { display: grid; gap: 18px; margin: 28px 0 40px; }
+  .content .panel { padding: 20px clamp(16px, 2.2vw, 26px); }
+  .content pre { overflow-x: auto; margin: 10px 0 0; padding: 14px 16px;
+                 background: rgba(0,0,0,.28); border-radius: 8px; line-height: 1.5; }
+  .content pre code { font-size: .86rem; white-space: pre; }
+  .content .note { margin: 12px 0 0; opacity: .85; line-height: 1.6; }
+  .content table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  .content td { padding: 7px 10px 7px 0; vertical-align: top; border-top: 1px solid var(--elev, rgba(255,255,255,.08)); }
+  .content td:first-child { white-space: nowrap; width: 1%; padding-right: 20px; }
+  .content tr:first-child td { border-top: 0; }
+
+  /* header top-right: About + source link */
+  header { position: relative; padding-right: 158px; }
+  .top-links { position: absolute; top: 2px; right: 0; display: inline-flex; align-items: center; gap: 16px; }
+  .navlink { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; color: var(--paper-dim); background: none; border: 0; padding: 0; cursor: pointer; transition: color .14s; }
+  .navlink:hover { color: var(--accent); }
+  .gh-link { display: inline-flex; color: var(--paper-dim); transition: color .14s, transform .14s; }
+  .gh-link:hover { color: var(--accent); transform: translateY(-1px); }
+  .gh-link svg { display: block; }
+
+  /* About dialog */
+  .about { max-width: 560px; width: calc(100% - 40px); background: var(--surface); color: var(--paper); border: 1px solid var(--rule-hi); border-radius: 14px; box-shadow: var(--elev); padding: 0; }
+  .about::backdrop { background: rgba(4, 5, 8, 0.72); }
+  .about-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 22px; border-bottom: 1px solid var(--rule); }
+  .about-head h2 { margin: 0; font-family: var(--display); font-weight: 500; font-size: 22px; }
+  .about-close { font: inherit; font-size: 18px; line-height: 1; color: var(--paper-dim); background: none; border: 0; cursor: pointer; padding: 4px; }
+  .about-close:hover { color: var(--accent); }
+  .about-body { padding: 18px 22px 22px; }
+  .about-body h3 { margin: 18px 0 6px; font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--paper-dimmer); }
+  .about-body h3:first-child { margin-top: 0; }
+  .about-body p { margin: 0 0 4px; color: var(--paper-dim); font-size: 14px; line-height: 1.6; }
+  .about-body strong { color: var(--paper); font-weight: 600; }
+  .about-links { margin-top: 16px !important; }
+
+  footer { margin-top: 22px; font-size: 12.5px; color: var(--paper-dimmer); }
+
+  /* narrow screens: let the header text use the full width instead of reserving
+     a right-hand gutter for the absolute top-links — put those in normal flow */
+  @media (max-width: 560px) {
+    header { padding-right: 0; }
+    .top-links { position: static; display: flex; justify-content: flex-end; margin-bottom: 16px; }
+    .eyebrow { letter-spacing: 0.12em; }
+    .eyebrow::before { display: none; }
+  }
+
+  /* ── your tool's styles below ─────────────────────────────────────────── */
+  /* Mobile tip: give CSS-grid columns minmax(0, …) and every grid/flex child
+     min-width: 0, and make <pre>/code blocks max-width:100% overflow-x:auto —
+     otherwise long lines force the whole page to scroll horizontally on phones. */
+  .content { flex: 1 1 auto; margin-top: clamp(22px, 3.5vh, 40px); }
+</style>
+</head>
+<body>
+<main class="app">
+  <header>
+    <div class="top-links">
+      <!-- Home link back to the budhash.com portfolio index -->
+      <a class="navlink" href="/">home</a>
+      <button type="button" class="navlink" id="aboutOpen">about</button>
+      <a class="gh-link" href="https://github.com/budhash/herald" target="_blank" rel="noopener" aria-label="View source on GitHub" title="View source on GitHub">
+        <svg viewBox="0 0 16 16" width="26" height="26" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg>
+      </a>
+    </div>
+    <div class="eyebrow">cli · bash 3.2 · apache-2.0</div>
+    <h1>her<span class="dev">ald</span></h1>
+    <p class="subtitle">Cross-pane messaging for <a href="https://github.com/herdrdev/herdr" rel="noopener">herdr</a>.
+      Two agent sessions in different panes, tabs or workspaces exchange messages directly, instead of a
+      human relaying between them — bounded by a delivery budget that runs out and pauses for review.</p>
+  </header>
+
+  <section class="content">
+    <div class="panel">
+      <div class="label">install</div>
+      <pre><code>curl -fsSL https://github.com/budhash/herald/releases/latest/download/install.sh | bash</code></pre>
+      <p class="note">One file, no runtime dependencies beyond <span class="tag">herdr</span> and
+        <span class="tag">jq</span>. The companion agent skill is embedded in the script, so
+        <code>herald skill install</code> works however herald got onto the machine.</p>
+    </div>
+
+    <div class="panel">
+      <div class="label">what it does</div>
+      <pre><code>session A (w1:p1)                       session B (w2:p3)
+    |  herald send w2:p3 --body-file notes.md   |
+    |------------------------------------------>|  submitted, and verified
+    |                                           |
+    |<------------------------------------------|  herald send w1:p1 "done"
+    |                                           |
+    [paused] budget exhausted -> waiting for the human</code></pre>
+      <p class="note">A channel is the unordered pair of pane ids, so both sides share one transcript
+        and one budget. <strong>"Delivered" means submitted, and verified</strong> — herald confirms the
+        peer actually started working. If the text landed in the prompt but never submitted, it says so
+        and exits <code>3</code> rather than reporting success.</p>
+    </div>
+
+    <div class="panel">
+      <div class="label">commands</div>
+      <table>
+        <tr><td><code>herald ls</code></td><td>list running agent sessions: pane · status · directory</td></tr>
+        <tr><td><code>herald send &lt;peer&gt;</code></td><td>record and deliver, verifying submission</td></tr>
+        <tr><td><code>herald read &lt;peer&gt;</code></td><td>the shared transcript</td></tr>
+        <tr><td><code>herald peek &lt;peer&gt;</code></td><td>the peer's raw output, not just what it heralded</td></tr>
+        <tr><td><code>herald roster</code></td><td>every channel: budget · age · submit state</td></tr>
+        <tr><td><code>herald nudge &lt;peer&gt;</code></td><td>re-submit a stuck message (costs no budget)</td></tr>
+        <tr><td><code>herald resume &lt;peer&gt;</code></td><td>grant budget and flush the queue</td></tr>
+      </table>
+    </div>
+
+    <div class="panel">
+      <div class="label">why the budget exists</div>
+      <p class="note">The budget is enforced in the CLI, not by agent goodwill. At zero, the next send is
+        recorded but <strong>not delivered</strong>, and only <code>herald resume</code> releases it.
+        That pause is the feature: it is where a human reads the transcript and decides whether the
+        collaboration is still going anywhere. An unbounded agent-to-agent message bus is easy, and
+        worthless.</p>
+      <p class="note">
+        <a href="https://github.com/budhash/herald" rel="noopener">Source &amp; documentation ↗</a>
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    built by <a href="https://github.com/budhash" rel="noopener">budhash</a>.
+  </footer>
+
+  <!-- About dialog: opened by the header "About" button -->
+  <dialog id="about" class="about">
+    <div class="about-head">
+      <h2>About herald</h2>
+      <button type="button" class="about-close" id="aboutClose" aria-label="Close">✕</button>
+    </div>
+    <div class="about-body">
+      <p><strong>herald</strong> lets two agent sessions running under
+        <a href="https://github.com/herdrdev/herdr" rel="noopener">herdr</a> exchange messages directly,
+        instead of a human copying output from one pane into the other.</p>
+      <h3>How it works</h3>
+      <p>Delivery is a prompt submission, not an API call: herald types the message into the peer's
+        prompt and then verifies the peer actually started working on it. Channel state — transcript,
+        queue and budget — lives under <code>~/.local/state/herald</code>.</p>
+      <h3>Scope</h3>
+      <p>Point-to-point only, and both panes must be on the same herdr server. It is not a group chat
+        and not a cross-host message bus.</p>
+      <h3>Privacy</h3>
+      <p>This page is static — it has no scripts beyond the About dialog and sends nothing anywhere.
+        herald itself runs entirely on your machine, over herdr's local socket.</p>
+      <p class="about-links">
+        <a href="https://github.com/budhash/herald" rel="noopener">Source</a> · Apache-2.0 licensed
+      </p>
+    </div>
+  </dialog>
+</main>
+
+<script>
+  // About dialog: open/close (native <dialog>; also closes on Escape)
+  const about = document.getElementById("about");
+  document.getElementById("aboutOpen").addEventListener("click", () => about.showModal());
+  document.getElementById("aboutClose").addEventListener("click", () => about.close());
+  about.addEventListener("click", (e) => { if (e.target === about) about.close(); });
+
+</script>
+</body>
+</html>

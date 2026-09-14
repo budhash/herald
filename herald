@@ -1,0 +1,747 @@
+#!/usr/bin/env bash
+# herald — bounded, human-gated messaging between two agent sessions running under herdr.
+#
+# Replaces a human relaying messages between two sessions by hand. Session A runs
+#   herald send <peer-pane> "<message>"        (or --body-file/--stdin for shell-safe text)
+# which records the message to a shared transcript AND submits it into the peer's herdr prompt.
+# "Delivered" means SUBMITTED, verified: `herdr agent prompt --wait` requires an observed state change
+# and reports a stall when text was typed but never processed; on a stall herald presses Enter itself
+# and re-checks. Only if THAT fails does the send exit 3 and say so (recover with `herald nudge`).
+# Every step is bounded — `send` is a foreground command and must never look like a hang.
+# The peer replies the same way. The exchange is BOUNDED: a shared per-channel
+# budget of N deliveries is enforced HERE (not by agent goodwill) — when it hits 0 the next send is
+# PAUSED (recorded but not delivered) for you to review, then `herald resume` grants more. You watch
+# both panes in herdr and can interrupt anytime. Not fully autonomous, by design.
+#
+# Identity: your own pane id is auto-detected (herdr pane current). Peers are herdr pane ids — see
+# `herald ls`. Channel = the unordered pair, so both sides share one transcript + one budget.
+# macOS/Linux, needs herdr + jq. HERALD_DRYRUN=1 REHEARSES a send: prints the exact delivery and changes
+# nothing (no budget spend, no transcript row). HERALD_STUB_HERDR=1 is a test-only hook that stubs the
+# herdr transport while letting state advance normally — the two are deliberately separate.
+set -euo pipefail
+
+HERALD_VERSION="1.0.0"
+_DELIVER_NOTE=""   # why a delivery could not be confirmed, set by _deliver for the caller to surface
+
+HERALD_STATE="${HERALD_STATE:-$HOME/.local/state/herald}"
+HERALD_DEFAULT_ROUNDS="${HERALD_ROUNDS:-6}"   # deliveries allowed before an auto-pause for the human
+# How long to let a BUSY peer finish before delivering. Deliberately short: `send` is a foreground
+# command, and a long wait here reads as a hang and trips callers' command timeouts. On expiry we
+# deliver anyway (the wait is best-effort). Raise it if you would rather queue behind a long task.
+HERALD_WAIT_MS="${HERALD_WAIT_MS:-15000}"
+# How long to wait for proof the peer ACTED on the prompt. Must exceed herdr's own 5000ms
+# stall window, or a stall surfaces as an ambiguous timeout instead of `agent_prompt_stalled`.
+HERALD_SUBMIT_MS="${HERALD_SUBMIT_MS:-8000}"
+HERALD_ENTER_MS="${HERALD_ENTER_MS:-3000}"    # confirmation window after the fallback Enter
+
+_usage() { cat >&2 <<'EOF'
+herald — bounded, human-gated herald between two herdr Claude sessions
+  herald ls                                 list claude sessions (pane · status · cwd) to find your peer
+  herald roster                             ALL my channels: peer · agent · budget · last-msg age · submit
+  herald open  <peer-pane> [--rounds N]     open/reset a channel; budget N deliveries (default 6)
+  herald send  <peer-pane> <message...>     record + deliver to the peer (verifies submit); pauses at budget 0
+  herald send  <peer-pane> --body-file <f>  same, but read the message from a FILE (shell-safe)
+  herald send  <peer-pane> --stdin          same, but read the message from stdin (shell-safe)
+  herald nudge <peer-pane>                  re-submit a typed-but-unsubmitted message (costs NO budget)
+  herald read  [<peer-pane>] [--new]        print the channel transcript (the heralded messages)
+  herald peek  <peer-pane> [--lines N]      read the peer's RAW recent output (its actual response, N=60)
+  herald status [<peer-pane>]               budget left + last activity
+  herald resume [<peer-pane>] [--rounds N]  grant N more deliveries + flush any paused message
+  herald resume <peer-pane> --drop          discard a stuck paused message WITHOUT delivering it
+  herald close <peer-pane>                  end + archive the channel
+  herald skill <install|status|show>        install/inspect the companion Claude skill (embedded)
+<peer-pane> is a herdr pane id (e.g. w4:p4 — see `herald ls`). Your own identity is auto-detected.
+Message text passed as ARGUMENTS is expanded by your shell first (backticks!). For anything technical,
+use --body-file/--stdin so the content reaches the peer byte-for-byte.
+Pre-authorize a work phase in one go: `herald resume <peer> --rounds 20` (the auto-pause stays a backstop).
+Exit: 0 delivered+submitted · 3 typed-but-NOT-submitted (see `herald nudge`) · 4 PAUSED at budget 0
+(nothing delivered; only the human can release it) · 1 failed/error. At budget 0 a SECOND send is
+refused outright rather than queueing a duplicate — retrying cannot get through.
+HERALD_DRYRUN=1 rehearses a send: prints the delivery, spends no budget, records nothing.
+EOF
+}
+
+_die() { echo "herald: $*" >&2; exit 1; }
+for _t in herdr jq; do command -v "$_t" >/dev/null 2>&1 || { [ -n "${HERALD_DRYRUN:-}${HERALD_STUB_HERDR:-}" ] || _die "needs '$_t' on PATH"; }; done
+
+_me() {  # my own herdr pane id (auto), or $HERALD_ME override
+  if [ -n "${HERALD_ME:-}" ]; then echo "$HERALD_ME"; return; fi
+  herdr pane current 2>/dev/null | jq -r '.result.pane.pane_id // empty' 2>/dev/null
+}
+
+_me_or_die() {  # my pane id, or a message that names the ACTUAL problem
+  local m; m="$(_me)"
+  [ -n "$m" ] || _die "cannot detect my herdr pane id.
+   Channels are keyed by BOTH pane ids, so herald must run inside the herdr pane that owns the
+   channel — from a plain shell it cannot tell which channel is yours.
+   Run it in that pane, or set HERALD_ME=<pane-id> (see: herald ls)."
+  echo "$m"
+}
+
+_chan_dir() {  # $1=me $2=peer -> the shared channel dir (order-independent)
+  local a="$1" b="$2" lo hi
+  if [[ "$a" < "$b" ]]; then lo="$a"; hi="$b"; else lo="$b"; hi="$a"; fi
+  echo "$HERALD_STATE/$(printf '%s__%s' "$lo" "$hi" | tr -c 'A-Za-z0-9._-' '_')"
+}
+
+_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+_slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# A channel carries traffic in BOTH directions but used to have ONE `pending` slot, so a message queued
+# by one side silently overwrote the other's — and `resume` then flushed whatever happened to be there,
+# in whichever direction, attributing it to the resumer. Queues are now per-AUTHOR.
+_pending_mine() { echo "$1/pending.$(_slug "$2")"; }   # $1=chan dir $2=author pane
+
+_pfrom() {  # $1=queue file $2=me $3=peer -> the AUTHOR. Queue files written before authors were
+  # recorded carry only `.to`; in a two-party channel the author is simply the other side.
+  local v; v="$(jq -r '.from // empty' "$1" 2>/dev/null)"
+  if [ -n "$v" ]; then echo "$v"; return; fi
+  if [ "$(jq -r '.to' "$1" 2>/dev/null)" = "$3" ]; then echo "$2"; else echo "$3"; fi
+}
+
+_pending_all() {  # every queued message in the channel, both directions (legacy `pending` included),
+  # OLDEST FIRST. Order used to be the alphabetical accident of the glob, so whether you read the peer's
+  # reply before or after your own dispatch landed depended on your pane id. Flushing in authoring order
+  # is the only defensible rule: a queued message is delivered in the sequence it was actually written.
+  local c="$1" f
+  for f in "$c"/pending.* "$c"/pending; do
+    [ -f "$f" ] && printf '%s\t%s\n' "$(_mtime "$f")" "$f"
+  done | sort -n | cut -f2-
+  return 0
+}
+
+_deliver() {  # $1=peer-pane $2=text — deliver + VERIFY submission. 0=submitted 2=typed-not-submitted 1=failed
+  if [ -n "${HERALD_DRYRUN:-}" ]; then
+    printf 'DRYRUN deliver -> %s:\n' "$1"; printf '%s\n' "$2" | sed 's/^/  | /'
+    return 0
+  fi
+  # TEST HOOK — stub the TRANSPORT only: no herdr call, but the caller's state transitions (budget spend,
+  # transcript row) still happen. Distinct from HERALD_DRYRUN, which is a user-facing REHEARSAL that must
+  # mutate nothing. Tests need budget/pause behavior to advance WITHOUT typing into a real pane.
+  if [ -n "${HERALD_STUB_HERDR:-}" ]; then
+    # =fail simulates a dead pane / herdr failure so the no-spend-on-failure path is testable;
+    # =stalled simulates text typed into a prompt that never submitted (the 0.7.5 Codex symptom)
+    [ "$HERALD_STUB_HERDR" = "fail" ] && return 1
+    [ "$HERALD_STUB_HERDR" = "stalled" ] && { printf 'STUB deliver (STALLED) -> %s\n' "$1"; return 2; }
+    printf 'STUB deliver -> %s\n' "$1"; return 0
+  fi
+  # Wait for the peer to SETTLE before typing (don't clobber a peer mid-turn). Use herdr's default
+  # predicate — idle OR done OR blocked — not `--until idle`: a Claude session that has finished a turn
+  # sits in `done`, so waiting for `idle` blocks for the entire timeout and looks like a hang. (0.7.5
+  # also renamed `--status`→`--until`; because this is best-effort the rename failed SILENTLY, which
+  # hid the wrong predicate underneath it.) Best-effort: on expiry we deliver anyway.
+  herdr agent wait "$1" --timeout "$HERALD_WAIT_MS" >/dev/null 2>&1 || true
+  # Did it actually settle? This decides whether the verification below can be BELIEVED. herdr warns
+  # that `--wait` "does not track turns: if the agent is already working, that active turn's completion
+  # may match" — so against a peer that never settled, neither success nor timeout says anything about
+  # OUR message. Delivering anyway is still useful (the text queues in the prompt), but claiming it was
+  # submitted is not: that produced a green "flushed" for a message left sitting unread in the prompt.
+  local pre; pre="$(_agent_status "$1")"
+  # `agent prompt --wait` puts the text in and reports whether anything actually STARTED — it returns
+  # `agent_prompt_stalled` when the text was typed but never processed. It is not a reliable submit on
+  # its own, though: some agents are left holding the text with no Enter applied. So treat a stall as
+  # "typed, not yet submitted" and press Enter ourselves rather than handing that chore to the caller.
+  local out rc
+  out="$(herdr agent prompt "$1" "$2" --wait --timeout "$HERALD_SUBMIT_MS" 2>&1)" && rc=0 || rc=$?
+  case "$out" in
+    *agent_not_found*|*'"code":"pane'*) return 1 ;;   # the pane is gone — nothing landed
+  esac
+  if [ "$pre" = "working" ]; then
+    # The peer never settled, so the text is QUEUED in its prompt and will not run until that turn ends
+    # (if at all). Report it as unverified rather than inventing a confirmation we do not have.
+    _DELIVER_NOTE="the peer was mid-turn, so the text is queued in its prompt and has NOT run yet"
+    return 2
+  fi
+  [ "$rc" -eq 0 ] && return 0
+  case "$out" in
+    # From a SETTLED start, herdr guarantees an observed state change or a stall. So a timeout here
+    # means the peer took the prompt and is still working — a real submission.
+    *'"code":"timeout"'*)   return 0 ;;
+    *agent_prompt_stalled*) _press_enter "$1" && return 0
+                            _DELIVER_NOTE="the prompt is holding the text and Enter did not take"
+                            return 2 ;;
+    *) return 1 ;;                       # herdr down, … — a real failure
+  esac
+}
+
+_agent_status() {  # $1=pane -> herdr's live agent_status, or empty
+  herdr agent list 2>/dev/null \
+    | jq -r --arg p "$1" '.result.agents[] | select(.pane_id==$p) | .agent_status // empty' 2>/dev/null
+}
+
+_seq() {  # herdr's monotonic per-agent state counter — "did ANYTHING happen", independent of which state
+  herdr agent list 2>/dev/null \
+    | jq -r --arg p "$1" '.result.agents[] | select(.pane_id==$p) | .state_change_seq // empty' 2>/dev/null
+}
+
+_press_enter() {  # submit a prompt that is holding unsubmitted text; 0 = confirmed it started
+  local before after
+  before="$(_seq "$1")"
+  herdr agent send-keys "$1" Enter >/dev/null 2>&1 || return 2   # 2 = unreachable, distinct from "did not take"
+  # Primary check: the peer started working. Secondary: any state change at all — a fast agent can
+  # finish and settle again inside the window, which `--until working` would miss and misreport.
+  herdr agent wait "$1" --until working --timeout "$HERALD_ENTER_MS" >/dev/null 2>&1 && return 0
+  after="$(_seq "$1")"
+  [ -n "$before" ] && [ -n "$after" ] && [ "$after" != "$before" ] && return 0
+  return 1
+}
+
+_fmt() {  # $1=from-pane $2=budget-left-after $3=body -> the text delivered into the peer's prompt
+  printf '[herald ← %s · %s delivery(ies) left before human check]\n%s\n\n↳ reply with: herald send %s "…"   (or wait for the human)' \
+    "$1" "$2" "$3" "$1"
+}
+
+# A LISTING must never die — an unreachable or mismatched herdr means "no peers to show", not a hard
+# failure. Found live on 2026-08-08: mid herdr 0.7.5→0.8.0, the 0.8.0 CLI answered `agent list` with a
+# protocol_mismatch error and a NONZERO exit, which `set -o pipefail` turned into a dead `herald ls` —
+# the one command you reach for to find out what is going on. Capture first, then parse, so neither the
+# herdr call nor an unparseable body can kill the caller.
+cmd_ls() {
+  local _raw
+  _raw="$(herdr agent list 2>/dev/null || true)"
+  printf '%s\n' "$_raw" \
+    | jq -r '.result.agents[]? | "\(.pane_id)\t\(.agent_status)\t\(.foreground_cwd)"' 2>/dev/null \
+    | sed 's/\t/  /g' || true
+  return 0
+}
+
+_resolve_peer() {  # $1 may be a peer-pane; if omitted, use the single open channel's peer
+  if [ -n "${1:-}" ]; then echo "$1"; return; fi
+  # infer: exactly one channel dir containing our pane id
+  local me; me="$(_me_or_die)"
+  local hits=() d
+  for d in "$HERALD_STATE"/*; do [ -d "$d" ] || continue; case "$(basename "$d")" in *"$(printf '%s' "$me" | tr -c 'A-Za-z0-9._-' '_')"*) hits+=("$d") ;; esac; done
+  [ "${#hits[@]}" -eq 1 ] || _die "specify <peer-pane> (0 or multiple open channels)"
+  cat "${hits[0]}/peer"
+}
+
+cmd_open() {
+  local peer="$1"; shift || true
+  local rounds="$HERALD_DEFAULT_ROUNDS"
+  case "${1:-}" in --rounds) rounds="${2:?--rounds needs N}" ;; esac
+  local me; me="$(_me_or_die)"
+  local c; c="$(_chan_dir "$me" "$peer")"
+  mkdir -p "$c"; echo "$peer" > "$c/peer"; echo "$rounds" > "$c/budget"; rm -f "$c/pending"
+  : >> "$c/messages.jsonl"
+  echo "herald: channel open (me=$me peer=$peer) budget=$rounds deliveries"
+}
+
+_ensure_channel() {  # $1=me $2=peer -> echoes chan dir, auto-opening with default budget if new
+  local c; c="$(_chan_dir "$1" "$2")"
+  if [ ! -f "$c/budget" ]; then mkdir -p "$c"; echo "$2" > "$c/peer"; echo "$HERALD_DEFAULT_ROUNDS" > "$c/budget"; : >> "$c/messages.jsonl"
+    echo "herald: (auto-opened channel, budget=$HERALD_DEFAULT_ROUNDS)" >&2; fi
+  echo "$c"
+}
+
+cmd_send() {
+  local peer="$1"; shift || _die "usage: herald send <peer-pane> <message...>"
+  # Message content must never be subject to SHELL interpretation. Passing a technical directive as an
+  # argument means the CALLER's shell expands it first: backticks in `constraint: str | tuple[...]` got
+  # command-substituted by zsh and the peer received a silently corrupted spec. --body-file/--stdin give
+  # a path where the text never touches a shell at all (same reason `gh pr create` has --body-file).
+  local body=""
+  case "${1:-}" in
+    --body-file) local src="${2:?--body-file needs a path}"
+                 [ -f "$src" ] || _die "no such file: $src"
+                 body="$(cat "$src")" ;;
+    --stdin)     body="$(cat)" ;;
+    *)           body="$*" ;;
+  esac
+  [ -n "$body" ] || _die "empty message"
+  local me; me="$(_me_or_die)"
+  local c; c="$(_ensure_channel "$me" "$peer")"
+  local budget; budget="$(cat "$c/budget" 2>/dev/null || echo 0)"
+  local ts; ts="$(_now)"
+  # One queued message per author, and nothing may overtake it. This refuses BOTH the retry-at-zero that
+  # piled up duplicates AND the subtler case where a resume grants budget while your own message is
+  # still queued — a new send would then reach the peer BEFORE the older one it is meant to follow.
+  local mine; mine="$(_pending_mine "$c" "$me")"
+  if [ -f "$mine" ] && [ -z "${HERALD_DRYRUN:-}" ]; then
+    _die "you already have a message queued on this channel — refusing to queue or send another,
+   because it would reach $peer BEFORE the one that is waiting.
+   flush it:    herald resume $peer [--rounds N]
+   read it:     herald read $peer
+   discard it:  herald resume $peer --drop"
+  fi
+  if [ "$budget" -le 0 ]; then
+    jq -cn --arg ts "$ts" --arg from "$me" --arg to "$peer" --arg body "$body" \
+      '{ts:$ts,from:$from,to:$to,delivered:false,body:$body}' >> "$c/messages.jsonl"
+    # record the AUTHOR too: resume must attribute the message to whoever wrote it, not to whoever
+    # released it, and must deliver it in the direction it was actually addressed.
+    jq -cn --arg from "$me" --arg to "$peer" --arg body "$body" '{from:$from,to:$to,body:$body}' > "$mine"
+    echo "🛑 herald: budget exhausted — message RECORDED but NOT delivered (paused for human review)."
+    echo "   review: herald read $peer   ·   continue: herald resume $peer [--rounds N]"
+    # Nonzero so a caller cannot mistake a pause for a delivery (this used to exit 0).
+    return 4
+  fi
+  local left=$((budget-1))
+  # DRYRUN is a PREVIEW: show exactly what would be delivered, but mutate nothing — no budget spend and
+  # no transcript row. (It used to do both, so rehearsing a message silently burned a real delivery.)
+  if [ -n "${HERALD_DRYRUN:-}" ]; then
+    _deliver "$peer" "$(_fmt "$me" "$left" "$body")"
+    echo "herald: DRYRUN — nothing delivered, budget untouched ($budget delivery/ies still available)"
+    return 0
+  fi
+  # Warn BEFORE spending the last delivery, not after — so the human can top up the budget first
+  # instead of discovering the channel is empty once the message is already gone.
+  [ "$left" -le 0 ] && echo "herald: heads-up — this is the LAST delivery; the peer's reply will pause for you." >&2
+  # Deliver FIRST, then record + spend. A failed delivery (dead pane, wrong id, herdr down) must not
+  # burn a delivery or leave a delivered:true row claiming something the peer never saw.
+  local drc=0; _deliver "$peer" "$(_fmt "$me" "$left" "$body")" || drc=$?
+  if [ "$drc" -eq 1 ]; then
+    jq -cn --arg ts "$ts" --arg from "$me" --arg to "$peer" --arg body "$body" \
+      '{ts:$ts,from:$from,to:$to,delivered:false,error:"delivery failed",body:$body}' >> "$c/messages.jsonl"
+    _die "delivery to $peer FAILED (pane gone? check: herald ls) — budget untouched ($budget left)"
+  fi
+  if [ "$drc" -eq 2 ]; then
+    # The text IS in the peer's prompt but nothing started. Spend the budget anyway: the message landed,
+    # so a re-send would APPEND to an already-populated prompt and corrupt it. Say so distinctly instead
+    # of printing the green "delivered" that made every send need a manual peek to trust.
+    jq -cn --arg ts "$ts" --arg from "$me" --arg to "$peer" --argjson left "$left" --arg body "$body" \
+      '{ts:$ts,from:$from,to:$to,delivered:true,submitted:false,budget_left:$left,body:$body}' >> "$c/messages.jsonl"
+    echo "$left" > "$c/budget"
+    local why="the text is sitting in the prompt unprocessed"
+    [ -n "$_DELIVER_NOTE" ] && why="$_DELIVER_NOTE"
+    echo "⚠️  herald: TYPED but NOT SUBMITTED — $why."
+    echo "   submit it:  herald nudge $peer     (free — costs no budget)"
+    echo "   inspect:    herald peek $peer"
+    return 3
+  fi
+  jq -cn --arg ts "$ts" --arg from "$me" --arg to "$peer" --argjson left "$left" --arg body "$body" \
+    '{ts:$ts,from:$from,to:$to,delivered:true,submitted:true,budget_left:$left,body:$body}' >> "$c/messages.jsonl"
+  echo "$left" > "$c/budget"
+  if [ "$left" -le 0 ]; then echo "herald: delivered + submitted — that was the LAST hop; the peer's reply will pause for you."
+  else echo "herald: delivered + submitted to $peer ($left delivery/ies left before pause)"; fi
+}
+
+cmd_resume() {
+  local peer; peer="$(_resolve_peer "${1:-}")"; case "${1:-}" in --rounds) peer="$(_resolve_peer "")" ;; *) shift || true ;; esac
+  local rounds="$HERALD_DEFAULT_ROUNDS" drop=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rounds) rounds="${2:?--rounds needs N}"; shift 2 ;;
+      --drop)   drop=1; shift ;;                 # discard a stuck pending message instead of flushing it
+      *)        shift ;;
+    esac
+  done
+  local me; me="$(_me_or_die)"
+  local c; c="$(_chan_dir "$me" "$peer")"
+  [ -f "$c/budget" ] || _die "no channel between $me and $peer — see your channels with: herald roster"
+  local had; had="$(cat "$c/budget" 2>/dev/null || echo 0)"
+  local q n=0; q="$(_pending_all "$c")"; [ -n "$q" ] && n="$(printf '%s\n' "$q" | grep -c .)"
+  if [ -n "$drop" ]; then
+    [ "$n" -gt 0 ] || _die "nothing queued to drop on this channel"
+    while read -r f; do [ -n "$f" ] || continue; rm -f "$f"; done <<EOF
+$q
+EOF
+    echo "$rounds" > "$c/budget"
+    echo "herald: DROPPED $n queued message(s) (never delivered) — budget=$rounds"
+    return 0
+  fi
+  if [ -n "${HERALD_DRYRUN:-}" ]; then
+    # A rehearsal must not consume the queue: this used to fall through to the flush path, where the
+    # DRYRUN _deliver returns 0, so the code then cleared the queue and spent budget — destroying the
+    # very message it was asked to preview.
+    local f
+    while read -r f; do
+      [ -n "$f" ] || continue
+      echo "-- queued: $(_pfrom "$f" "$me" "$peer") → $(jq -r '.to' "$f")"
+      _deliver "$(jq -r '.to' "$f")" "$(_fmt "$(_pfrom "$f" "$me" "$peer")" "$((rounds-1))" "$(jq -r '.body' "$f")")" || true
+    done <<EOF
+$q
+EOF
+    echo "herald: DRYRUN — would grant budget=$rounds and flush $n message(s); nothing changed (still $had, still queued)"
+    return 0
+  fi
+  if [ "$n" -eq 0 ]; then
+    echo "$rounds" > "$c/budget"
+    echo "herald: resumed — budget=$rounds deliveries (nothing was queued)"
+    return 0
+  fi
+  # Drain EVERY queue, each in the direction it was addressed and attributed to whoever wrote it.
+  # A channel carries both directions; flushing "the" pending used to deliver whatever single slot
+  # existed — so one side releasing its own message could instead fire the PEER's queued reply
+  # back into its own pane, stamped with the wrong sender.
+  local left="$rounds" rc=0 sent=0 f
+  echo "$rounds" > "$c/budget"
+  while read -r f; do
+    [ -n "$f" ] || continue
+    local pfrom pto pbody drc=0
+    pto="$(jq -r '.to' "$f")"; pbody="$(jq -r '.body' "$f")"; pfrom="$(_pfrom "$f" "$me" "$peer")"
+    left=$((left-1))
+    # Capture the status: a BARE call here meant `set -e` killed resume mid-flush the moment delivery
+    # failed — before the budget was written and before the queue was cleared — so the channel stayed
+    # stuck on "run herald resume to flush" while resume appeared to do nothing at all. Silently.
+    _deliver "$pto" "$(_fmt "$pfrom" "$left" "$pbody")" || drc=$?
+    if [ "$drc" -eq 1 ]; then
+      left=$((left+1)); rc=1
+      echo "⚠️  herald: delivery of the $pfrom → $pto message FAILED — kept queued for a retry." >&2
+      continue
+    fi
+    # The text reached the prompt (submitted or not), so the queue must clear either way — leaving it
+    # would re-deliver the same message on the next resume.
+    rm -f "$f"; sent=$((sent+1))
+    if [ "$drc" -eq 2 ]; then
+      local why="it is sitting in the prompt unprocessed"
+      [ -n "$_DELIVER_NOTE" ] && why="$_DELIVER_NOTE"
+      echo "⚠️  herald: flushed $pfrom → $pto but it was TYPED and NOT submitted ($why)."
+      echo "   submit it:  herald nudge $pto     (free — costs no budget)"
+      rc=3
+    else
+      echo "herald: flushed the paused $pfrom → $pto message"
+    fi
+  done <<EOF
+$q
+EOF
+  echo "$left" > "$c/budget"
+  echo "herald: resumed (budget=$rounds, $sent of $n flushed, $left left)"
+  return "$rc"
+}
+
+cmd_read() {
+  local new=""; case "${1:-}" in --new) new=1; shift ;; esac
+  local peer; peer="$(_resolve_peer "${1:-}")"; case "${2:-}" in --new) new=1 ;; esac
+  local me; me="$(_me_or_die)"; local c; c="$(_chan_dir "$me" "$peer")"
+  [ -f "$c/messages.jsonl" ] || _die "no channel to $peer"
+  # --new shows only what arrived since the last `read --new`, so catching up on a busy channel does not
+  # mean re-reading the whole transcript. The marker is a line offset in the append-only log.
+  local total seen=0
+  total="$(grep -c . "$c/messages.jsonl" 2>/dev/null || echo 0)"
+  if [ -n "$new" ]; then
+    seen="$(cat "$c/lastread" 2>/dev/null || echo 0)"
+    case "$seen" in ''|*[!0-9]*) seen=0 ;; esac
+    [ "$seen" -gt "$total" ] && seen=0   # log was reset/archived under us
+  fi
+  # Distinguish the undelivered states — they mean different things and want different action:
+  # PAUSED = held by the budget cap (resume flushes it); FAILED = the transport rejected it (nothing is
+  # queued; fix the pane and send again); TYPED = it reached the prompt but never ran (`herald nudge`).
+  tail -n "+$((seen + 1))" "$c/messages.jsonl" \
+    | jq -r 'select(has("body")) | "\(.ts)  \(.from) → \(.to)\(if .delivered==false then (if .error then " [FAILED/not sent]" else " [PAUSED/undelivered]" end) elif .submitted==false then " [TYPED/not submitted]" else "" end):\n  \(.body|gsub("\n";"\n  "))"'
+  [ -n "$new" ] && echo "$total" > "$c/lastread"
+  return 0
+}
+
+cmd_peek() {  # read the peer's RAW recent pane output (not just heralded messages) — read-only, no inject
+  local peer="${1:-}"; [ -n "$peer" ] || _die "usage: herald peek <peer-pane> [--lines N]"; shift
+  local lines=60; case "${1:-}" in --lines) lines="${2:?--lines needs N}" ;; esac
+  if [ -n "${HERALD_DRYRUN:-}" ]; then echo "DRYRUN peek <- $peer (recent $lines lines)"; return 0; fi
+  if [ -n "${HERALD_STUB_HERDR:-}" ]; then echo "STUB peek <- $peer (recent $lines lines)"; return 0; fi
+  # Format-agnostic across herdr versions: 0.7.5's `--format text` returns PLAIN TEXT, while the JSON
+  # envelope (.result.read.text) is what older builds emitted. Parse as JSON if it looks like JSON,
+  # otherwise print the raw output. (Piping plain text through jq silently yielded nothing and made peek
+  # look broken — caught by the live shakedown.)
+  local out
+  out="$(herdr agent read "$peer" --source recent --lines "$lines" --format text 2>/dev/null)" \
+    || _die "could not read $peer (running? correct pane id?)"
+  # Stamp the read. Raw scrollback carries no time of its own, so a peer's OLD report reads exactly like
+  # current work — a stale peek was once mistaken for a live one. The header makes the ambiguity visible:
+  # it dates the READ, and the peer's status says whether anything is still moving.
+  local pstat; pstat="$(herdr agent list 2>/dev/null \
+    | jq -r --arg p "$peer" '.result.agents[] | select(.pane_id==$p) | .agent_status' 2>/dev/null || true)"
+  printf -- '--- peek %s · agent=%s · read at %s (scrollback may be older) ---\n' \
+    "$peer" "${pstat:-?}" "$(_now)"
+  case "$out" in
+    '{'*) printf '%s' "$out" | jq -r '.result.read.text // empty' 2>/dev/null || printf '%s\n' "$out" ;;
+    *)    printf '%s\n' "$out" ;;
+  esac
+}
+
+_mtime() {  # epoch mtime of $1 — BSD (macOS) and GNU stat differ; try both, 0 if neither works
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+}
+
+_age() {  # $1=epoch-seconds -> compact human age ("42s" "7m" "3h" "2d")
+  [ "${1:-0}" -eq 0 ] && { echo "-"; return; }
+  local now s; now="$(date +%s)"; s=$((now - $1))
+  if   [ "$s" -lt 60 ]    ; then echo "${s}s"
+  elif [ "$s" -lt 3600 ]  ; then echo "$((s/60))m"
+  elif [ "$s" -lt 86400 ] ; then echo "$((s/3600))h"
+  else                           echo "$((s/86400))d"; fi
+}
+
+_submit_state() {  # $1=channel dir -> last KNOWN submit state (message rows and nudge rows both carry it)
+  [ -s "$1/messages.jsonl" ] || { echo "-"; return; }
+  local v; v="$(jq -rs 'map(select(has("submitted"))) | last | if . == null then "-" elif .submitted then "ok" else "TYPED-ONLY" end' \
+    "$1/messages.jsonl" 2>/dev/null || echo "-")"
+  echo "${v:--}"
+}
+
+cmd_nudge() {  # press Enter on a peer whose prompt holds an unsubmitted message — FREE, spends no budget
+  local peer="${1:-}"; [ -n "$peer" ] || _die "usage: herald nudge <peer-pane>"
+  if [ -n "${HERALD_DRYRUN:-}" ]; then echo "DRYRUN nudge -> $peer"; return 0; fi
+  local ok=0
+  if [ -n "${HERALD_STUB_HERDR:-}" ]; then
+    [ "$HERALD_STUB_HERDR" = "fail" ] && _die "nudge to $peer FAILED (pane gone? check: herald ls)"
+    [ "$HERALD_STUB_HERDR" = "stalled" ] && ok=1
+    echo "STUB nudge -> $peer"
+  else
+    _press_enter "$peer" || ok=$?
+    [ "$ok" -eq 2 ] && _die "nudge to $peer FAILED (pane gone? check: herald ls)"
+  fi
+  local me; me="$(_me_or_die)"; local c; c="$(_chan_dir "$me" "$peer")"
+  if [ "$ok" -eq 0 ]; then
+    # Append the outcome rather than rewriting history — messages.jsonl is append-only, and this row
+    # is what lets `roster` show the message as submitted after a successful nudge.
+    [ -d "$c" ] && jq -cn --arg ts "$(_now)" --arg from "$me" --arg to "$peer" \
+      '{ts:$ts,from:$from,to:$to,event:"nudge",submitted:true}' >> "$c/messages.jsonl"
+    echo "herald: nudged $peer — it is now working (the message was submitted)"
+    return 0
+  fi
+  echo "⚠️  herald: nudged $peer but it did NOT start working."
+  echo "   Some agents (notably Codex) ignore a bare Enter on a stuck prompt. Inspect with:"
+  echo "     herald peek $peer"
+  echo "   If the prompt still holds the text, clear it in the pane by hand before re-sending —"
+  echo "   a fresh 'herald send' APPENDS to whatever is already there."
+  return 3
+}
+
+cmd_roster() {  # one coordinator view over every channel I hold — replaces ls + N×status + N×peek
+  local me; me="$(_me_or_die)"
+  local key; key="$(printf '%s' "$me" | tr -c 'A-Za-z0-9._-' '_')"
+  # one herdr call for LIVE agent status; herald supplies the wall-clock it owns (its own state mtimes),
+  # because `agent list` reports no last-activity time of its own
+  local live; live="$(herdr agent list 2>/dev/null \
+    | jq -r '.result.agents[] | "\(.pane_id) \(.agent_status)"' 2>/dev/null || true)"
+  printf '%-10s %-9s %-7s %-12s %s\n' PEER AGENT BUDGET LAST-MSG SUBMIT
+  local d found=0
+  for d in "$HERALD_STATE"/*; do
+    [ -d "$d" ] || continue
+    case "$(basename "$d")" in
+      *.closed-*) continue ;;          # archived channels are history, not roster rows
+      *"$key"*)   ;;
+      *)          continue ;;
+    esac
+    [ -f "$d/peer" ] || continue
+    found=1
+    local peer budget st agent pend
+    peer="$(cat "$d/peer")"
+    budget="$(cat "$d/budget" 2>/dev/null || echo '?')"
+    agent="$(printf '%s\n' "$live" | awk -v p="$peer" '$1==p {print $2; exit}')"
+    st="$(_submit_state "$d")"
+    pend=""
+    local nq; nq="$(_pending_all "$d" | grep -c . || true)"
+    [ "${nq:-0}" -gt 0 ] && pend=" PAUSED:$nq"
+    printf '%-10s %-9s %-7s %-12s %s%s\n' \
+      "$peer" "${agent:-?}" "$budget" "$(_age "$(_mtime "$d/messages.jsonl")")" "$st" "$pend"
+  done
+  [ "$found" -eq 1 ] || echo "(no open channels — herald open <peer-pane>)"
+}
+
+cmd_status() {
+  local peer; peer="$(_resolve_peer "${1:-}")"
+  local me; me="$(_me_or_die)"; local c; c="$(_chan_dir "$me" "$peer")"
+  [ -f "$c/budget" ] || _die "no channel to $peer"
+  echo "channel: me=$me peer=$peer"
+  echo "budget:  $(cat "$c/budget") delivery(ies) left before auto-pause"
+  # Name the DIRECTION. A channel queues both ways, and "pending: 1" read as "my message is waiting"
+  # when it was in fact the peer's reply waiting for you — which made resume look like it did nothing.
+  # Read from a here-doc, not a pipe: `set -o pipefail` makes a `... | while read` swallow the rest of
+  # the function when any pipeline component reports non-zero, which silently truncated this output.
+  local q f; q="$(_pending_all "$c")"
+  if [ -n "$q" ]; then
+    while read -r f; do
+      [ -n "$f" ] || continue
+      echo "pending: $(_pfrom "$f" "$me" "$peer") → $(jq -r '.to' "$f") undelivered (herald resume $peer to flush)"
+    done <<EOF
+$q
+EOF
+  fi
+  echo "messages: $(grep -c . "$c/messages.jsonl" 2>/dev/null || echo 0)"
+}
+
+cmd_close() {
+  local peer="${1:?usage: herald close <peer-pane>}"
+  local me; me="$(_me_or_die)"; local c; c="$(_chan_dir "$me" "$peer")"
+  [ -d "$c" ] || _die "no channel to $peer"
+  mv "$c" "$c.closed-$(date +%s)" 2>/dev/null || true
+  echo "herald: channel to $peer closed (transcript archived)"
+}
+
+
+# ── the companion Claude skill ────────────────────────────────────────────────
+# EMBEDDED so a bare `herald` script is self-sufficient: no zip, no sibling files, no network.
+# Source of truth is skills/herald/SKILL.md; `make sync-skill` regenerates this block and CI fails
+# if the two drift. Quoted heredoc — the skill text is full of backticks and $(…) that must NOT expand.
+HERALD_SKILL_DIR="${HERALD_SKILL_DIR:-$HOME/.claude/skills/herald}"
+
+_skill_doc() { cat <<'__HERALD_SKILL__'
+---
+name: herald
+description: Exchange messages directly with a peer agent session in another herdr pane, tab, or workspace, instead of the human relaying between them. Bounded and human-gated. Use when you're collaborating with another running session and want to hand work back and forth.
+---
+
+# herald — talking to your peer session
+
+You are one of **two peer agent sessions** collaborating in different herdr panes — which may be in the
+same tab, different tabs, or different workspaces. Normally the human relays messages between you; the
+`herald` CLI (on `$PATH`) lets you exchange them directly. It is **bounded and human-supervised** — you
+cannot run an unbounded back-and-forth, by design.
+
+## How to use it
+
+1. **Find your peer's pane id:** `herald ls` — lists the running agent sessions with their pane id and
+   working directory. Your peer is whichever session the human has paired you with.
+2. **Send a message:** `herald send <peer-pane> "your message"` — this records it to a shared transcript
+   and submits it into the peer's prompt. Example: `herald send w4:p4 "Plan looks good;
+   implement step 2 and report the diff."`
+   - **For anything technical, use `--body-file` or `--stdin`.** A message passed as an argument is
+     expanded by YOUR shell first: backticks and `$(…)` in code identifiers, type signatures or column
+     names get command-substituted, and the peer silently receives a corrupted spec. Write the message
+     to a file and send `herald send w4:p4 --body-file /tmp/spec.md`, exactly as you would use
+     `gh pr create --body-file`.
+   - **Check the exit status — branch on it, don't assume success.**
+     | code | meaning | what to do |
+     |---|---|---|
+     | `0` | delivered **and** submitted (verified) | nothing — no confirming `peek` needed |
+     | `3` | **typed into the prompt but never submitted** — the peer has NOT seen it | `herald nudge <peer-pane>` (free, no budget) |
+     | `4` | **paused** at budget 0 — nothing was delivered | stop; only the human can release it |
+     | `1` | failed outright, nothing landed | check `herald roster`; the pane may be gone |
+     Exit `3` is common when the peer was **mid-turn**: herald waits ~15s for it to settle, then delivers
+     anyway, but will not claim a submission it cannot verify. The text is sitting in their prompt —
+     nudge once they settle. Sending to a peer that has been working for minutes is the main way
+     messages end up unread.
+3. **Receiving:** when a prompt arrives beginning with `[herald ← <pane> · N delivery(ies) left …]`, that
+   message is **from your peer session, not the human**. Read it, do the work it asks, and reply with
+   `herald send <that-pane> "…"`.
+
+## The rules (respect these)
+
+- **Honor the budget.** The exchange has a shared delivery budget. When `herald` tells you
+  **"budget exhausted — paused for human review,"** STOP heralding immediately. Summarize the current
+  state for the human and wait. Do **not** try to force more rounds, raise the budget, or find another
+  channel — the pause is intentional so the human can steer. They will `herald resume` if they want more.
+  If the human has already pre-authorized a work phase with a large ceiling (`herald resume <peer>
+  --rounds 20`), the same rule still applies when that ceiling runs out: stop and summarize.
+- **One clear ask per message.** Your peer sees only what you send, not your full context or scrollback.
+  Make each message self-contained: state what you're delivering or exactly what you need back.
+- **A queue is per-author, and you may hold only one.** While your own message is queued, `herald send`
+  refuses — a new send would reach the peer *before* the one still waiting. Release it (`herald resume
+  <peer>`) or abandon it (`herald resume <peer> --drop`) first.
+- **Read `pending` carefully: it names a DIRECTION.** `pending: w4:p4 → w4:p1 undelivered` is the *peer's*
+  reply waiting for **you**, not your message waiting for them. A channel queues both ways, and `resume`
+  drains every queue to its own recipient. Never conclude "my message never went" from a pending count
+  alone — check whose it is.
+- **Stay in the role the human gave you**, and don't impersonate the human or speak for them.
+- **The human is watching both panes** and may interrupt or redirect at any moment — that's expected.
+
+## What herald CANNOT do (know these before you rely on it)
+
+- **Point-to-point only — it is not a group chat.** A channel is exactly two panes. There is no
+  broadcast, no third participant, no "reply all". To involve another session, the human wires it.
+- **Both sides must be on the SAME herdr server** (it talks over the local socket). You cannot herald a
+  session on another machine, or one running outside herdr.
+- **Delivery is a prompt submission, not an API call.** herald submits into the peer's prompt and
+  verifies the peer actually started working. It waits for the peer to be idle first, but that wait is
+  best-effort — a *wedged* peer just times out. Some agents (notably Codex) can leave a message sitting
+  unsubmitted; that is exit 3, not a delivery. Very long messages are slow; keep them tight.
+- **Sending is not the same as being understood.** A verified send means the peer *received and started
+  processing* the text — not that it agreed, understood, or did the right thing. There is no read
+  receipt for comprehension: if it matters, ask for an explicit acknowledgement, or `herald peek`.
+- **You cannot raise your own budget.** `herald resume` is the human's lever. If you find yourself
+  wanting more rounds, that IS the signal to stop and summarize for them.
+- **`peek` shows RAW terminal output**, including UI chrome, spinners and partial lines — it is a
+  window, not a clean transcript. `herald read` is the clean record of what was actually heralded.
+  **Scrollback carries no timestamp of its own**, so an old report looks exactly like current work.
+  peek prints a header with the read time and the peer's live status — trust that, not the content's
+  apparent recency, and confirm against real state (git, files) before concluding a peer finished.
+- **State is machine-local and unsynced** (`~/.local/state/herald/`), and a `herald close` archives the
+  channel — the peer is not notified that you closed it.
+- **herald is coupled to herdr's CLI.** A herdr upgrade can break it (0.7.5 changed the output format of
+  `agent read`, which silently broke `peek` until it was fixed). If a herald command behaves strangely
+  right after a herdr upgrade, say so rather than working around it.
+- **The human sees everything and may interrupt at any time.** Nothing here is private or autonomous.
+
+## Handy
+
+- `herald roster` — **the coordinator view.** Every channel you hold in one table: peer, live agent
+  status, budget left, how long since the last message, and whether your last send was actually
+  submitted. Use this instead of `ls` + a `status` + a `peek` per peer. If you hold channels to more than
+  one peer, this is the command to reach for first.
+- `herald read <peer-pane>` — the full transcript of what was *heralded* (the messages, both directions).
+  `herald read <peer-pane> --new` shows only what arrived since you last caught up.
+- `herald peek <peer-pane> [--lines N]` — read the peer's **raw recent output** (its actual work/response,
+  not just what it chose to herald). Use this when the roster says something surprising.
+- `herald nudge <peer-pane>` — submit a message left sitting in the peer's prompt. Costs no budget.
+- `herald status <peer-pane>` — budget left, plus any queued message **and its direction**.
+- `herald resume <peer-pane> [--rounds N]` — the human's lever: grants budget and flushes every queued
+  message. `--drop` discards them instead. `HERALD_DRYRUN=1 herald resume <peer>` previews exactly what
+  would be delivered and changes nothing.
+
+Delivery waits for the peer to be idle before submitting, so you won't clobber a peer that's mid-task.
+
+## Coordinating more than one peer
+
+herald is point-to-point, so if you hold channels to several peers **you are the only shared context** —
+no peer can see another's channel. Two consequences worth planning around: never tell a peer to "wait for
+the other one" (it has no way to observe that), and when work depends on another peer, carry the fact
+across yourself. `herald roster` is what makes that tractable: one glance shows who is working, who is
+idle, and where budget is about to run out.
+__HERALD_SKILL__
+}
+
+cmd_skill() {   # install / repair / inspect the Claude skill that documents this CLI to an agent
+  local _sub="${1:-status}"; [ $# -gt 0 ] && shift
+  local _dir="$HERALD_SKILL_DIR" _force=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dir) shift; _dir="${1:?--dir needs a path}" ;;
+      --dir=*) _dir="${1#*=}" ;;
+      --force|-f) _force=1 ;;
+      *) _die "herald skill: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  local _f="$_dir/SKILL.md"
+  case "$_sub" in
+    show) _skill_doc ;;
+    install)
+      if [ -f "$_f" ] && [ -z "$_force" ] && _skill_doc | cmp -s - "$_f"; then
+        if [ -L "$_f" ]; then echo "herald: skill already current at $_f (symlink -> $(readlink "$_f" 2>/dev/null))"
+        else echo "herald: skill already current at $_f"; fi
+        return 0
+      fi
+      # A symlink here may be deliberate — another tool can own this path. Never clobber it silently.
+      if [ -L "$_f" ] && [ -z "$_force" ]; then
+        _die "refusing to replace a SYMLINK: $_f
+   It points at $(readlink "$_f" 2>/dev/null).
+   Something else manages this file. Use --force to overwrite, or --dir to install elsewhere."
+      fi
+      mkdir -p "$_dir" || _die "cannot create $_dir"
+      _skill_doc > "$_f.tmp.$$" || _die "cannot write $_dir"
+      mv -f "$_f.tmp.$$" "$_f" || _die "cannot install $_f"
+      echo "herald: skill installed -> $_f"
+      ;;
+    uninstall)
+      if [ -e "$_f" ] || [ -L "$_f" ]; then
+        rm -f "$_f"; rmdir "$_dir" 2>/dev/null || true
+        echo "herald: skill removed from $_f"
+      else echo "herald: no skill at $_f"; fi
+      ;;
+    status)
+      if [ -L "$_f" ]; then echo "symlink  $_f -> $(readlink "$_f" 2>/dev/null)"
+      elif [ ! -f "$_f" ]; then echo "missing  $_f   (run: herald skill install)"; return 1
+      elif _skill_doc | cmp -s - "$_f"; then echo "current  $_f"
+      else echo "STALE    $_f   (differs from this herald $HERALD_VERSION — run: herald skill install)"; return 1; fi
+      ;;
+    *) _die "usage: herald skill <install|uninstall|status|show> [--dir <path>] [--force]" ;;
+  esac
+}
+
+
+case "${1:-}" in
+  ls)      shift; cmd_ls ;;
+  roster)  shift; cmd_roster ;;
+  nudge)   shift; cmd_nudge "$@" ;;
+  open)    shift; [ -n "${1:-}" ] || _die "usage: herald open <peer-pane> [--rounds N]"; cmd_open "$@" ;;
+  send)    shift; cmd_send "$@" ;;
+  read)    shift; cmd_read "$@" ;;
+  peek)    shift; cmd_peek "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  resume)  shift; cmd_resume "$@" ;;
+  close)   shift; cmd_close "$@" ;;
+  skill)   shift; cmd_skill "$@" ;;
+  -v|--version|version) printf 'herald %s\n' "$HERALD_VERSION"; exit 0 ;;
+  -h|--help|help|"") _usage; [ -n "${1:-}" ] && exit 0 || exit 2 ;;
+  *) _die "unknown command '$1' (see: herald help)" ;;
+esac

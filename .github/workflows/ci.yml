@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [ main, 'claude/**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # herald targets the bash macOS ships (3.2), so both matter:
+        # GNU userland on linux, BSD userland on macos.
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: show environment
+        run: |
+          bash --version | head -1
+          jq --version || true
+
+      - name: syntax check
+        run: make syntax
+
+      - name: shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y shellcheck || brew install shellcheck
+          fi
+          make lint
+
+      - name: no private terms
+        run: make private-scan
+
+      - name: embedded skill is in sync
+        run: make skill-sync
+
+      - name: version matches version.txt
+        run: make version
+
+      - name: test suite
+        run: make test

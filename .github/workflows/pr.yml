@@ -1,0 +1,38 @@
+name: pr
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: show environment
+        run: bash --version | head -1
+
+      - name: syntax check
+        run: make syntax
+
+      - name: no private terms
+        run: make private-scan
+
+      - name: embedded skill is in sync
+        run: make skill-sync
+
+      - name: version matches version.txt
+        run: make version
+
+      - name: test suite
+        run: make test

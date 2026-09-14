@@ -1,0 +1,7 @@
+# test sandboxes
+.orig/
+*.tmp
+dist/
+
+# macOS
+.DS_Store

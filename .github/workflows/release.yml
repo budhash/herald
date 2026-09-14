@@ -1,0 +1,160 @@
+name: release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: syntax + skill sync + version
+        run: |
+          make syntax
+          make skill-sync
+          make version
+
+      - name: test suite
+        run: make test
+
+      - name: the tag must match version.txt
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          file="$(cat version.txt)"
+          if [ "$tag" != "$file" ]; then
+            echo "tag v$tag does not match version.txt ($file)" >&2
+            exit 1
+          fi
+          echo "tag and version.txt agree: $file"
+
+      - name: smoke test the artifact exactly as the README tells users to
+        run: |
+          # install to a scratch prefix, then prove the installed copy is self-sufficient
+          d="$(mktemp -d)"
+          HERALD_SKILL_DIR="$d/sk" ./install.sh --prefix "$d/bin"
+          "$d/bin/herald" --version
+          "$d/bin/herald" skill status --dir "$d/sk"
+          # a herald copied ALONE must still carry its skill (the embedding is the point)
+          cp "$d/bin/herald" "$d/lonely"
+          "$d/lonely" skill show | head -3
+          HERALD_SKILL_DIR="$d/sk" ./install.sh --uninstall --prefix "$d/bin"
+
+  publish:
+    name: publish
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: build release assets
+        run: |
+          mkdir -p dist
+          cp herald install.sh dist/
+          chmod +x dist/herald dist/install.sh
+          cd dist
+          # checksums the installer verifies before it will install anything
+          sha256sum herald > herald.sha256
+          sha256sum install.sh > install.sh.sha256
+          ls -l
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/herald dist/herald.sha256 dist/install.sh dist/install.sh.sha256
+
+  homebrew:
+    name: update Homebrew tap
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Ordered last and non-fatal: the GitHub release has already shipped by the time this runs, so a
+    # tap failure must never fail the release. If the token is missing this job goes red on its own.
+    needs: [publish]
+    continue-on-error: true
+    steps:
+      - name: version from tag
+        id: version
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "number=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: source-tarball sha256
+        id: sha
+        run: |
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${{ steps.version.outputs.tag }}.tar.gz"
+          curl -fsSL "$URL" -o source.tar.gz
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: generate formula
+        run: |
+          mkdir -p dist
+          cat > dist/herald.rb <<'RUBY'
+          class Herald < Formula
+            desc "Bounded, human-gated messaging between agent sessions running under herdr"
+            homepage "https://github.com/budhash/herald"
+            url "${{ steps.sha.outputs.url }}"
+            sha256 "${{ steps.sha.outputs.sha256 }}"
+            version "${{ steps.version.outputs.number }}"
+            license "Apache-2.0"
+
+            depends_on "jq"
+
+            def install
+              bin.install "herald"
+            end
+
+            def caveats
+              <<~EOS
+                herald talks through herdr, which Homebrew does not install for you:
+                  https://github.com/herdrdev/herdr
+
+                Install the companion agent skill with:
+                  herald skill install
+              EOS
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/herald --version")
+            end
+          end
+          RUBY
+          cat dist/herald.rb
+          ruby -c dist/herald.rb
+
+      - name: push formula to budhash/homebrew-tools
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set — skipping tap update."
+            echo "Add a fine-grained PAT (Contents: Read+write on budhash/homebrew-tools) as HOMEBREW_TAP_TOKEN."
+            exit 1
+          fi
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/budhash/homebrew-tools.git" tap
+          mkdir -p tap/Formula
+          cp dist/herald.rb tap/Formula/herald.rb
+          cd tap
+          git config user.name "budhash"
+          git config user.email "budhash@users.noreply.github.com"
+          git add Formula/herald.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date — nothing to push."
+            exit 0
+          fi
+          git commit -m "herald ${{ steps.version.outputs.number }}"
+          git push

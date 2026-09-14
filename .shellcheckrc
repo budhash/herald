@@ -1,0 +1,29 @@
+# shellcheck configuration for herald
+# Disable specific checks that conflict with our framework design
+
+# SC2034: Variable appears unused (we have many utility functions with intentionally unused vars)
+disable=SC2034
+
+# SC2086: Double quote to prevent globbing (we intentionally use unquoted vars in some utility functions)
+disable=SC2086
+
+# SC2016: Expressions don't expand in single quotes (we use this intentionally for templates)
+disable=SC2016
+
+# SC2015: Note that A && B || C is not if-then-else (we use this pattern intentionally)
+disable=SC2015
+
+# SC2155: Declare and assign separately to avoid masking return values (conflicts with our style)
+disable=SC2155
+
+# Enable additional checks
+enable=check-sourced
+enable=check-unassigned-uppercase
+
+# Set shell dialect
+shell=bash
+
+# Exclude paths (add as needed)
+exclude-dir=.git
+exclude-dir=node_modules
+exclude-dir=test_output
