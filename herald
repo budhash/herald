@@ -453,8 +453,16 @@ cmd_peek() {  # read the peer's RAW recent pane output (not just heralded messag
   esac
 }
 
-_mtime() {  # epoch mtime of $1 — BSD (macOS) and GNU stat differ; try both, 0 if neither works
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0
+_mtime() {  # epoch mtime of $1 — BSD (macOS) and GNU stat differ.
+  # GNU first, and VALIDATE the result is digits. `stat -f` means two different things: on BSD it is
+  # the format string (%m = mtime), on GNU it is --file-system, where %m is the MOUNT POINT. So GNU
+  # answers `stat -f %m` with "/" and exit 0 — the old BSD-first order never reached its fallback, and
+  # every queued message sorted equal on Linux, collapsing flush order back to glob order.
+  local m
+  m="$(stat -c %Y "$1" 2>/dev/null)"
+  case "$m" in ''|*[!0-9]*) m="$(stat -f %m "$1" 2>/dev/null)" ;; esac
+  case "$m" in ''|*[!0-9]*) m=0 ;; esac
+  printf '%s\n' "$m"
 }
 
 _age() {  # $1=epoch-seconds -> compact human age ("42s" "7m" "3h" "2d")
