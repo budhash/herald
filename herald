@@ -35,8 +35,8 @@ HERALD_SUBMIT_MS="${HERALD_SUBMIT_MS:-8000}"
 HERALD_ENTER_MS="${HERALD_ENTER_MS:-3000}"    # confirmation window after the fallback Enter
 
 _usage() { cat >&2 <<'EOF'
-herald — bounded, human-gated herald between two herdr Claude sessions
-  herald ls                                 list claude sessions (pane · status · cwd) to find your peer
+herald — bounded, human-gated messaging between two agent sessions under herdr
+  herald ls                                 list agent sessions (pane · status · cwd) to find your peer
   herald roster                             ALL my channels: peer · agent · budget · last-msg age · submit
   herald open  <peer-pane> [--rounds N]     open/reset a channel; budget N deliveries (default 6)
   herald send  <peer-pane> <message...>     record + deliver to the peer (verifies submit); pauses at budget 0
@@ -49,7 +49,7 @@ herald — bounded, human-gated herald between two herdr Claude sessions
   herald resume [<peer-pane>] [--rounds N]  grant N more deliveries + flush any paused message
   herald resume <peer-pane> --drop          discard a stuck paused message WITHOUT delivering it
   herald close <peer-pane>                  end + archive the channel
-  herald skill <install|status|show>        install/inspect the companion Claude skill (embedded)
+  herald skill <install|status|show>        install/inspect the companion agent skill (embedded)
 <peer-pane> is a herdr pane id (e.g. w4:p4 — see `herald ls`). Your own identity is auto-detected.
 Message text passed as ARGUMENTS is expanded by your shell first (backticks!). For anything technical,
 use --body-file/--stdin so the content reaches the peer byte-for-byte.
@@ -62,7 +62,13 @@ EOF
 }
 
 _die() { echo "herald: $*" >&2; exit 1; }
-for _t in herdr jq; do command -v "$_t" >/dev/null 2>&1 || { [ -n "${HERALD_DRYRUN:-}${HERALD_STUB_HERDR:-}" ] || _die "needs '$_t' on PATH"; }; done
+# Transport deps are required only by the verbs that actually use the transport. `--version`,
+# `--help` and `skill` must work on a machine where herdr is not installed YET — brew can install
+# herald first, and `herald skill install` is exactly what you want to run before herdr exists.
+case "${1:-}" in
+  -v|--version|version|-h|--help|help|skill|"") ;;
+  *) for _t in herdr jq; do command -v "$_t" >/dev/null 2>&1 || { [ -n "${HERALD_DRYRUN:-}${HERALD_STUB_HERDR:-}" ] || _die "needs '$_t' on PATH"; }; done ;;
+esac
 
 _me() {  # my own herdr pane id (auto), or $HERALD_ME override
   if [ -n "${HERALD_ME:-}" ]; then echo "$HERALD_ME"; return; fi
@@ -127,7 +133,7 @@ _deliver() {  # $1=peer-pane $2=text — deliver + VERIFY submission. 0=submitte
     printf 'STUB deliver -> %s\n' "$1"; return 0
   fi
   # Wait for the peer to SETTLE before typing (don't clobber a peer mid-turn). Use herdr's default
-  # predicate — idle OR done OR blocked — not `--until idle`: a Claude session that has finished a turn
+  # predicate — idle OR done OR blocked — not `--until idle`: an agent that has finished a turn
   # sits in `done`, so waiting for `idle` blocks for the entire timeout and looks like a hang. (0.7.5
   # also renamed `--status`→`--until`; because this is best-effort the rename failed SILENTLY, which
   # hid the wrong predicate underneath it.) Best-effort: on expiry we deliver anyway.
@@ -559,7 +565,7 @@ cmd_close() {
 }
 
 
-# ── the companion Claude skill ────────────────────────────────────────────────
+# ── the companion agent skill ─────────────────────────────────────────────────
 # EMBEDDED so a bare `herald` script is self-sufficient: no zip, no sibling files, no network.
 # Source of truth is skills/herald/SKILL.md; `make sync-skill` regenerates this block and CI fails
 # if the two drift. Quoted heredoc — the skill text is full of backticks and $(…) that must NOT expand.
@@ -680,7 +686,7 @@ idle, and where budget is about to run out.
 __HERALD_SKILL__
 }
 
-cmd_skill() {   # install / repair / inspect the Claude skill that documents this CLI to an agent
+cmd_skill() {   # install / repair / inspect the skill that documents this CLI to an agent
   local _sub="${1:-status}"; [ $# -gt 0 ] && shift
   local _dir="$HERALD_SKILL_DIR" _force=""
   while [ $# -gt 0 ]; do

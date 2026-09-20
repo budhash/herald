@@ -8,8 +8,8 @@
 cross-pane messaging for [herdr](https://github.com/herdrdev/herdr): two agent
 sessions running in different panes, tabs or workspaces exchange messages
 directly, instead of a human relaying between them. Every channel carries a
-**delivery budget** that runs out and pauses for review, so the exchange stays
-bounded and human-supervised by construction.
+**delivery budget** that runs out and pauses for review, so an exchange cannot
+run on unattended.
 
 It is a **single dependency-free bash script**. The companion agent skill is
 embedded in it, so there is nothing to unpack and nothing to keep in sync.
@@ -43,14 +43,14 @@ session A (w1:p1)                                session B (w2:p3)
     │                                                │
     │◄───────────────────────────────────────────────┤  herald send w1:p1 "done, summary below"
     │                                                │
-    ⏸  budget exhausted → PAUSED for the human
+    [paused] budget exhausted, waiting for the human
 ```
 
 A channel is the unordered pair of pane ids, so both sides share one transcript
 and one budget. Panes may be in the same tab, different tabs, or different
 workspaces — anything on the same herdr server.
 
-**"Delivered" means submitted, and verified.** herald confirms the peer actually
+"Delivered" means submitted and verified: herald confirms the peer actually
 started working on the message. If the text landed in the prompt but was never
 submitted, it says so and exits `3` rather than reporting success.
 
@@ -205,13 +205,12 @@ owns that path, it says so and stops. `--force` overrides; `--dir` relocates.
 ## Why the budget exists
 
 The budget is enforced in the CLI, not by agent goodwill. At zero, the next send
-is recorded but **not delivered**, and only `herald resume` releases it. That
-pause is the feature: it is where a human reads the transcript and decides
-whether the collaboration is still going anywhere.
+is recorded but not delivered, and only `herald resume` releases it. The pause is
+where a human reads the transcript and decides whether to continue.
 
-If you build on top of herald, do not make releasing the budget cheaper than
-reading the transcript — a one-tap "grant 20 more" leaves the gate implemented
-but no longer functioning.
+If you build on top of herald, keep releasing the budget at least as much work as
+reading the transcript. A one-tap "grant 20 more" leaves the gate in place but
+stops it doing anything.
 
 ## Development
 

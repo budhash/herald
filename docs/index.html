@@ -103,7 +103,7 @@
     <h1>her<span class="dev">ald</span></h1>
     <p class="subtitle">Cross-pane messaging for <a href="https://github.com/herdrdev/herdr" rel="noopener">herdr</a>.
       Two agent sessions in different panes, tabs or workspaces exchange messages directly, instead of a
-      human relaying between them — bounded by a delivery budget that runs out and pauses for review.</p>
+      human relaying between them. A delivery budget runs out and pauses for review.</p>
   </header>
 
   <section class="content">
@@ -125,7 +125,7 @@
     |                                           |
     [paused] budget exhausted -> waiting for the human</code></pre>
       <p class="note">A channel is the unordered pair of pane ids, so both sides share one transcript
-        and one budget. <strong>"Delivered" means submitted, and verified</strong> — herald confirms the
+        and one budget. "Delivered" means submitted and verified: herald confirms the
         peer actually started working. If the text landed in the prompt but never submitted, it says so
         and exits <code>3</code> rather than reporting success.</p>
     </div>
@@ -146,10 +146,8 @@
     <div class="panel">
       <div class="label">why the budget exists</div>
       <p class="note">The budget is enforced in the CLI, not by agent goodwill. At zero, the next send is
-        recorded but <strong>not delivered</strong>, and only <code>herald resume</code> releases it.
-        That pause is the feature: it is where a human reads the transcript and decides whether the
-        collaboration is still going anywhere. An unbounded agent-to-agent message bus is easy, and
-        worthless.</p>
+        recorded but not delivered, and only <code>herald resume</code> releases it. The pause is where a
+        human reads the transcript and decides whether to continue.</p>
       <p class="note">
         <a href="https://github.com/budhash/herald" rel="noopener">Source &amp; documentation ↗</a>
       </p>

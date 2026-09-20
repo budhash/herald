@@ -491,4 +491,40 @@ test_installer() {
   rm -rf "$d"
 }
 
+test_works_without_herdr() {
+  _section_header "herald — offline verbs work with NO herdr installed (CI-found)"
+  # herdr may legitimately not be installed yet: brew can install herald first, and
+  # `herald skill install` is exactly what you want to run before herdr exists. Only the verbs that
+  # actually use the transport may demand it. This is what broke the first public CI run.
+  local bin; bin="$(mktemp -d "${TMPDIR:-/tmp}/heraldnodep-XXXXXX")"
+  local t
+  for t in bash sh env cat diff grep sed awk tr cut mktemp rm rmdir mkdir mv ln chmod cmp readlink dirname head printf; do
+    local src; src="$(command -v "$t" 2>/dev/null)" && ln -sf "$src" "$bin/$t"
+  done
+  # sanity: the stub PATH really has no herdr
+  assert_fail env -i PATH="$bin" command -v herdr "the sandbox PATH has no herdr"
+
+  assert_contains "$(env -i PATH="$bin" HOME="$bin" "$PWD/$HERALD" --version 2>&1)" "herald " \
+    "--version works without herdr"
+  assert_contains "$(env -i PATH="$bin" HOME="$bin" "$PWD/$HERALD" --help 2>&1)" "herald" \
+    "--help works without herdr"
+  assert_contains "$(env -i PATH="$bin" HOME="$bin" "$PWD/$HERALD" skill show 2>&1)" "name: herald" \
+    "skill show works without herdr"
+  assert_ok env -i PATH="$bin" HOME="$bin" "$PWD/$HERALD" skill install --dir "$bin/sk" \
+    "skill install works without herdr"
+
+  # …but a transport verb must still refuse, loudly
+  assert_contains "$(env -i PATH="$bin" HOME="$bin" "$PWD/$HERALD" ls 2>&1)" "needs 'herdr'" \
+    "a transport verb still demands herdr"
+  rm -rf "$bin"
+}
+
+test_no_stale_framing() {
+  _section_header "herald — user-facing text carries no stale or tool-specific framing"
+  local help; help="$("$HERALD" --help 2>&1)"
+  assert_eq 0 "$(printf '%s' "$help" | grep -ci 'claude session' || true)" \
+    "--help does not describe peers as a specific vendor's sessions"
+  assert_contains "$help" "agent sessions" "--help uses the generic framing"
+}
+
 _test_runner

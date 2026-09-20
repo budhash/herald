@@ -2,23 +2,23 @@
 
 > **herald** is a single bash 3.2 script that lets **two agent sessions in different
 > [herdr](https://github.com/herdrdev/herdr) panes, tabs or workspaces exchange messages directly**,
-> instead of a human relaying between them — while keeping the human in the loop *by construction* via
-> a per-channel delivery budget that runs out and pauses. Read this cold and you're oriented;
+> instead of a human relaying between them. A per-channel delivery budget runs out and pauses, so an
+> exchange cannot run on unattended. Read this cold and you're oriented;
 > `README.md` is the user-facing doc.
 > **Status: stable, v1.0.0.**
 
 ## Prime directive
 
-herald's whole value is that it is **bounded**. An unbounded agent-to-agent message bus is easy and
-worthless; the budget, the human pause, and the verified-submit semantics *are* the product.
+herald is useful because it is bounded. The budget, the pause, and verified submission are what it
+sells; an unbounded message bus would be less code and less use.
 
 - **Never weaken the gate.** The budget is enforced in the CLI, not by agent goodwill. Any change that
   makes exhausting or releasing it cheaper needs a very good reason.
 - **Stay one file.** herald is distributed as a single script with the skill embedded. No runtime
   dependencies beyond `herdr` and `jq`; no sibling files; no network at run time.
 - **bash 3.2.** macOS ships 3.2. No `declare -g`, no `${x^^}`, no associative arrays.
-- **Report honestly.** "Delivered" means *submitted, verified* — never "typed and hoped for". Exit codes
-  are load-bearing (see below); callers branch on them.
+- **Report what happened.** "Delivered" means submitted and verified, not typed and assumed. Callers
+  branch on the exit codes below, so do not renumber or repurpose them.
 
 ## Layout
 
@@ -27,7 +27,7 @@ herald                      THE script. bash 3.2. Contains the EMBEDDED skill (s
 install.sh                  Fetch/verify/place herald; delegates skill install to herald itself.
 skills/herald/SKILL.md      Editable SOURCE of the skill; embedded into `herald` by make sync-skill.
 tools/embed-skill.py        Does that embedding. Idempotent — replaces the block, never appends.
-test/run-tests.sh           138 tests. `.common/test-common` is the shared assertion harness.
+test/run-tests.sh           146 tests. `.common/test-common` is the shared assertion harness.
 version.txt                 Single source of version truth; CI fails if the script disagrees.
 Makefile                    syntax · lint · skill-sync · version · test · ci
 ```
@@ -61,7 +61,7 @@ that ownership. `--force` overrides; `--dir` installs elsewhere.
 ## Testing
 
 ```sh
-make test     # 138 tests, no herdr required
+make test     # 146 tests, no herdr required
 make ci       # syntax + lint + skill-sync + version + test
 ```
 
