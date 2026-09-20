@@ -88,6 +88,9 @@ The installer places exactly two things, and `--uninstall` removes exactly those
 | `~/.local/bin/herald` | the CLI |
 | `~/.claude/skills/herald/SKILL.md` | the companion agent skill |
 
+Installer flags: `--dry-run` (print every action, change nothing), `--prefix <dir>`
+(default `~/.local/bin`), `--uninstall`.
+
 ### Requirements
 
 - **bash 3.2+** — runs on the bash macOS ships; no bash 4 features
@@ -98,31 +101,19 @@ The installer checks for herdr and jq and reports what is missing, but does not
 install them. herdr is a terminal multiplexer whose upgrade can drop live panes,
 so pulling it in silently behind a one-liner would be the wrong call.
 
-## Options
-
-| option | applies to | effect |
-|---|---|---|
-| `--body-file <f>` | `send` | read the message from a file, byte-for-byte |
-| `--stdin` | `send` | read the message from stdin |
-| `--rounds N` | `open`, `resume` | set or grant N deliveries |
-| `--drop` | `resume` | discard a queued message instead of delivering it |
-| `--new` | `read` | show only what arrived since you last caught up |
-| `--lines N` | `peek` | how much raw peer output to show (default 60) |
-| `--dir <d>`, `--force` | `skill` | install the skill elsewhere / overwrite a symlink |
-
 ## Commands
 
 | command | what it does |
 |---|---|
 | `herald ls` | list running agent sessions: pane id · status · working directory |
 | `herald open <peer>` | open or reset a channel (a first `send` opens one too) |
-| `herald send <peer> …` | record and deliver a message, verifying submission |
-| `herald read [<peer>]` | the shared transcript |
-| `herald peek <peer>` | the peer's raw recent output, not just what it heralded |
+| `herald send <peer> …` | record and deliver a message, verifying submission. `--body-file <f>` / `--stdin` send text byte-for-byte |
+| `herald read [<peer>]` | the shared transcript; `--new` shows only what arrived since you last caught up |
+| `herald peek <peer>` | the peer's raw recent output, not just what it heralded (`--lines N`, default 60) |
 | `herald roster` | every channel: peer · agent status · budget · age · submit state |
 | `herald status [<peer>]` | budget left, plus any queued message and its direction |
 | `herald nudge <peer>` | re-submit a message left sitting in the peer's prompt (free) |
-| `herald resume <peer>` | grant budget and flush queued messages |
+| `herald resume <peer>` | grant budget (`--rounds N`) and flush queued messages; `--drop` discards them |
 | `herald close <peer>` | end and archive a channel |
 | `herald skill <sub>` | `install` · `status` · `show` · `uninstall` the agent skill |
 
@@ -194,6 +185,9 @@ owns that path, it says so and stops. `--force` overrides; `--dir` relocates.
   idle first, but that wait is best-effort — a wedged peer times out.
 - **Messages pass through a shell when given as arguments.** Use `--body-file` or
   `--stdin` for anything containing backticks or `$(…)`.
+- **Building a UI on top?** Keep releasing the budget at least as much work as
+  reading the transcript. A one-tap "grant 20 more" leaves the gate in place but
+  stops it doing anything.
 
 ## Known Issues
 
@@ -201,16 +195,6 @@ owns that path, it says so and stops. `--force` overrides; `--dir` relocates.
   in `herald read`, because the transcript stores each message's own submit state
   while `herald roster` reports the latest known state. The message did arrive;
   the transcript label is stale.
-
-## Why the budget exists
-
-The budget is enforced in the CLI, not by agent goodwill. At zero, the next send
-is recorded but not delivered, and only `herald resume` releases it. The pause is
-where a human reads the transcript and decides whether to continue.
-
-If you build on top of herald, keep releasing the budget at least as much work as
-reading the transcript. A one-tap "grant 20 more" leaves the gate in place but
-stops it doing anything.
 
 ## Development
 
