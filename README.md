@@ -59,7 +59,8 @@ submitted, it says so and exits `3` rather than reporting success.
 Homebrew:
 
 ```sh
-brew install budhash/tools/herald
+brew tap budhash/tools
+brew install herald
 ```
 
 Or the installer, which also writes the agent skill and checks your dependencies:
