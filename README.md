@@ -56,40 +56,37 @@ submitted, it says so and exits `3` rather than reporting success.
 
 ## Installing
 
+Homebrew:
+
+```sh
+brew install budhash/tools/herald
+```
+
+Or the installer, which also writes the agent skill and checks your dependencies:
+
 ```sh
 curl -fsSL https://github.com/budhash/herald/releases/latest/download/install.sh | bash
 ```
 
-Download and read it first, which is the better habit for anything piped to a shell:
-
-```sh
-curl -fsSLO https://github.com/budhash/herald/releases/latest/download/install.sh
-less install.sh && bash install.sh
-```
+Pipe-to-shell deserves a read first: `curl -fsSLO <same-url>`, then `less install.sh && bash install.sh`.
+Flags are `--dry-run`, `--prefix <dir>` (default `~/.local/bin`) and `--uninstall`.
 
 Or skip the installer — herald is one file:
 
 ```sh
-curl -kL https://github.com/budhash/herald/releases/latest/download/herald > herald
-chmod +x herald && ./herald skill install
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/budhash/herald/releases/latest/download/herald -o ~/.local/bin/herald
+chmod +x ~/.local/bin/herald && herald skill install
 ```
 
-Optionally verify the download against its published checksum:
+Every release publishes a `herald.sha256` beside it if you want to verify the download.
 
-```sh
-curl -kLO https://github.com/budhash/herald/releases/latest/download/herald.sha256
-shasum -a 256 -c herald.sha256
-```
-
-The installer places exactly two things, and `--uninstall` removes exactly those:
+Installing places exactly two things, and `--uninstall` removes exactly those:
 
 | path | what |
 |---|---|
 | `~/.local/bin/herald` | the CLI |
 | `~/.claude/skills/herald/SKILL.md` | the companion agent skill |
-
-Installer flags: `--dry-run` (print every action, change nothing), `--prefix <dir>`
-(default `~/.local/bin`), `--uninstall`.
 
 ### Requirements
 
